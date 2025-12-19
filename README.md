@@ -59,8 +59,8 @@ graph TD
     H --> I[Edge Density Scan]
     I --> J{Damage Threshold}
     
-    J -- "High Density" --> K[Damage Detected (Red Grid)]
-    J -- "Low Density" --> L[Safe Surface (Green Grid)]
+    J -- "High Density" --> K["Damage Detected (Red Grid)"]
+    J -- "Low Density" --> L["Safe Surface (Green Grid)"]
     
     K --> M[Final Result Overlay]
     L --> M
