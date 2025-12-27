@@ -69,7 +69,8 @@ def get_adaptive_road_mask(image):
     upper_bound = np.clip(upper_bound, 0, 255)
     
     # Modify Value range specifically to allow shadows/highlights
-    lower_bound[2] = max(0, mean[2] - 100) 
+    # aggressively lower the bound to include dark cracks/shadows as part of the road
+    lower_bound[2] = max(0, mean[2] - 180) 
     upper_bound[2] = 255
     
     # 3. Create Color Mask
@@ -117,6 +118,18 @@ def get_adaptive_road_mask(image):
     upper_white = np.array([180, 40, 255])
     white_mask = cv2.inRange(hsv, lower_white, upper_white)
     
+    # ---------------------------------------------------------
+    # NEW: Vegetation Filter (Remove Green)
+    # ---------------------------------------------------------
+    # Exclude green areas (grass/trees) to prevent false positives
+    # Hue 35-85 is roughly Green in OpenCV
+    lower_green = np.array([30, 40, 0])
+    upper_green = np.array([90, 255, 255])
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+    
+    # Remove green from the stats-based mask
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(green_mask))
+    
     lines_mask = cv2.bitwise_or(yellow_mask, white_mask)
     
     # Combine: (Adaptive Road) OR (Lines), but restricted to basically the road area
@@ -141,12 +154,11 @@ def detect_damage_texture(image, grid_rows=5, grid_cols=5):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     mask = get_adaptive_road_mask(image)
     
-    # Use Bilateral Filter instead of Gaussian
-    # This keeps edges (cracks) sharp but removes surface texture (grain)
-    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
+    # Use Bilateral Filter - Turn down sigma slightly to preserve texture
+    blurred = cv2.bilateralFilter(gray, 9, 50, 50)
     
-    # Stricter Canny Thresholds to ignore fine grain
-    edges = cv2.Canny(blurred, 60, 180)
+    # Stricter Canny Thresholds -> LOWER them to be MORE SENSITIVE
+    edges = cv2.Canny(blurred, 50, 150)
     edges_masked = cv2.bitwise_and(edges, edges, mask=mask)
     
     h, w = edges_masked.shape
@@ -171,16 +183,14 @@ def detect_damage_texture(image, grid_rows=5, grid_cols=5):
             cell_roi = edges_masked[y_start:y_end, x_start:x_end]
             edge_score = np.mean(cell_roi)
             
-            # Higher Threshold: Requires significant edge density (actual cracks)
-            # Normal road grain gives ~2-5. Cracks give > 15.
-            if edge_score > 20: 
+            # Lower Threshold: Catch fainter cracks (sensitivity up)
+            if edge_score > 12: 
                 grid_status[r, c] = 1 
                 
     return grid_status, mask
 
 def draw_hybrid_analysis(image, boxes, grid_rows=5, grid_cols=5):
     h, w, _ = image.shape
-    overlay = image.copy()
     
     cell_h = h // grid_rows
     cell_w = w // grid_cols
@@ -197,36 +207,44 @@ def draw_hybrid_analysis(image, boxes, grid_rows=5, grid_cols=5):
             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             
-            if cy < h and cx < w and road_mask[cy, cx] == 0:
-                continue
+            # Removed aggressive road mask check. If YOLO detects damage, we trust it.
+            # if cy < h and cx < w and road_mask[cy, cx] == 0:
+            #     continue
 
             col = int(cx // cell_w)
             row = int(cy // cell_h)
             col = max(0, min(col, grid_cols - 1))
             row = max(0, min(row, grid_rows - 1))
             final_grid[row, col] = 1
+            
+            # Draw standard prediction box (Red)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-    # Draw Grid
-    alpha = 0.45
+    # ---------------------------------------------------------
+    # NEW: Visualize Texture Analysis as Bounding Boxes
+    # ---------------------------------------------------------
+    # Reconstruct a detection mask from the grid
+    detection_mask = np.zeros((h, w), dtype=np.uint8)
     for r in range(grid_rows):
         for c in range(grid_cols):
-            x_start = c * cell_w
-            y_start = r * cell_h
-            x_end = (c + 1) * cell_w
-            y_end = (r + 1) * cell_h
-            
-            cell_mask = road_mask[y_start:y_end, x_start:x_end]
-            if cv2.countNonZero(cell_mask) < (cell_mask.size * 0.25):
-                continue
-            
-            color = (0, 255, 0) # Green
             if final_grid[r, c] == 1:
-                color = (0, 0, 255) # Red
-            
-            cv2.rectangle(overlay, (x_start, y_start), (x_end, y_end), color, -1)
-            cv2.rectangle(image, (x_start, y_start), (x_end, y_end), (255, 255, 255), 1)
+                x_start = c * cell_w
+                y_start = r * cell_h
+                x_end = (c + 1) * cell_w
+                y_end = (r + 1) * cell_h
+                cv2.rectangle(detection_mask, (x_start, y_start), (x_end, y_end), 255, -1)
+    
+    # Find contours on this mask to get boxes
+    contours, _ = cv2.findContours(detection_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x, y, w_box, h_box = cv2.boundingRect(cnt)
+        # Draw red box for texture-detected damage
+        cv2.rectangle(image, (x, y), (x + w_box, y + h_box), (0, 0, 255), 2)
+        # Optional: Add label
+        cv2.putText(image, "Damage", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    # Grid drawing removed as per user request to "remove colours line"
+    # We still return the image with boxes and the damage status
     return image, np.sum(final_grid) > 0
 
 @app.get("/", response_class=HTMLResponse)
